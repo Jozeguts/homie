@@ -1,0 +1,606 @@
+/*
+ * Homie ESP32 Smart Home Controller - Full Feature Set
+ * 
+ * Features:
+ * - WiFi Access Point
+ * - MQTT Client connecting to Android broker at 192.168.4.2
+ * - WebSocket server for real-time updates
+ * - HTTP server with REST-like API
+ * - Relay control via MQTT, WebSockets, or physical buttons
+ * - Temperature monitoring via DS18B20
+ * - Device configuration persistence
+ * - Manual override buttons with debounce
+ * - Status LED feedback
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SPIFFS.h>
+#include <Preferences.h>
+#include <PubSubClient.h>
+
+// WiFi Configuration
+const char* AP_SSID = "SmartHome_ESP32";
+const char* AP_PASSWORD = "smarthome123";
+const char* ANDROID_BROKER_IP = "192.168.4.1";  // Android phone's IP in AP subnet
+const int MQTT_PORT = 1883;
+
+// Hardware Configuration
+const int RELAY_PINS[] = {16, 17, 18, 19, 21, 22, 23, 25};
+const int BUTTON_PINS[] = {13, 12, 14, 27, 26, 33, 32, 35};
+const int NUM_DEVICES = 8;
+const int ONE_WIRE_BUS = 4;
+const int STATUS_LED = 2;
+
+// MQTT Configuration
+const char* MQTT_CLIENT_ID = "ESP32_HomieController";
+
+// Global objects
+WebSocketsServer webSocket = WebSocketsServer(81);
+WebServer httpServer(80);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);  // ✅ Now valid
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensors(&oneWire);
+Preferences preferences;
+
+// Device data structure
+struct Device {
+  String id;
+  String name;
+  String type;
+  String room;
+  bool isActive;
+  int pin;
+  float temperature;
+  unsigned long lastUpdate;
+};
+
+Device devices[NUM_DEVICES];
+bool buttonStates[NUM_DEVICES] = {true};
+bool lastButtonStates[NUM_DEVICES] = {true};
+unsigned long lastDebounceTime[NUM_DEVICES] = {0};
+
+// Timing
+unsigned long lastTemperatureRead = 0;
+unsigned long lastDataSync = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long lastPerformance = 0;
+const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long TEMPERATURE_INTERVAL = 10000;
+const unsigned long SYNC_INTERVAL = 30000;
+const unsigned long HEARTBEAT_INTERVAL = 60000;
+const unsigned long PERFORMANCE_INTERVAL = 45000;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== Homie ESP32 Controller (MQTT Client) Starting ===");
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+
+  preferences.begin("homie", false);
+
+  setupHardware();
+  loadDeviceConfiguration();
+  setupAccessPoint();
+  setupWebSocket();
+  setupHTTPServer();
+  setupMQTT();
+
+  Serial.println("=== Homie ESP32 Controller Ready ===");
+  blinkStatusLED(3);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  webSocket.loop();
+  httpServer.handleClient();
+
+  // Handle manual buttons
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    bool reading = digitalRead(BUTTON_PINS[i]);
+    if (reading != lastButtonStates[i]) {
+      lastDebounceTime[i] = currentMillis;
+    }
+    if ((currentMillis - lastDebounceTime[i]) > DEBOUNCE_DELAY) {
+      if (reading != buttonStates[i]) {
+        buttonStates[i] = reading;
+        if (buttonStates[i] == LOW) {
+          bool newState = !devices[i].isActive;
+          setDeviceState(i, newState);
+          publishDeviceState(i);
+          sendDeviceStateUpdate(i);
+          Serial.printf("Manual toggle: %s -> %s\n", devices[i].name.c_str(), newState ? "ON" : "OFF");
+        }
+      }
+    }
+    lastButtonStates[i] = reading;
+  }
+
+  // Read temperatures
+  if (currentMillis - lastTemperatureRead >= TEMPERATURE_INTERVAL) {
+    lastTemperatureRead = currentMillis;
+    tempSensors.requestTemperatures();
+    for (int i = 0; i < tempSensors.getDeviceCount() && i < NUM_DEVICES; i++) {
+      float temp = tempSensors.getTempCByIndex(i);
+      if (temp != DEVICE_DISCONNECTED_C) {
+        devices[i].temperature = temp;
+        devices[i].lastUpdate = currentMillis;
+        publishTemperatureUpdate(devices[i].id, temp);
+        sendTemperatureUpdate(devices[i].id, temp);
+      }
+    }
+  }
+
+  // Sync states periodically
+  if (currentMillis - lastDataSync >= SYNC_INTERVAL) {
+    lastDataSync = currentMillis;
+    publishAllDeviceStates();
+    sendAllDeviceStates();
+  }
+
+  // Send heartbeat
+  if (currentMillis - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    lastHeartbeat = currentMillis;
+    publishHeartbeat();
+    sendHeartbeat();
+  }
+
+  // Send performance metrics
+  if (currentMillis - lastPerformance >= PERFORMANCE_INTERVAL) {
+    lastPerformance = currentMillis;
+    publishPerformance();
+  }
+
+  // Handle MQTT
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  delay(10);
+}
+
+void setupHardware() {
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], devices[i].isActive ? HIGH : LOW);
+  }
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+  }
+  pinMode(STATUS_LED, OUTPUT);
+  tempSensors.begin();
+  Serial.println("Hardware initialized");
+}
+
+void setupAccessPoint() {
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.printf("SSID: %s | Pass: %s\n", AP_SSID, AP_PASSWORD);
+}
+
+void setupWebSocket() {
+  webSocket.begin();
+  webSocket.onEvent([](uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
+    if (type == WStype_CONNECTED) {
+      Serial.printf("WebSocket client %u connected\n", num);
+      sendInitialData(num);
+    } else if (type == WStype_TEXT) {
+      handleWebSocketMessage(num, (char*)payload, len);
+    }
+  });
+  Serial.println("WebSocket server started on port 81");
+}
+
+void setupHTTPServer() {
+  httpServer.on("/api/devices", HTTP_GET, []() {
+    DynamicJsonDocument doc(2048);
+    JsonArray arr = doc.createNestedArray("devices");
+    for (int i = 0; i < NUM_DEVICES; i++) {
+      JsonObject dev = arr.createNestedObject();
+      dev["id"] = devices[i].id;
+      dev["name"] = devices[i].name;
+      dev["type"] = devices[i].type;
+      dev["room"] = devices[i].room;
+      dev["isActive"] = devices[i].isActive;
+      dev["temperature"] = devices[i].temperature;
+      dev["pin"] = devices[i].pin;
+      dev["lastUpdate"] = devices[i].lastUpdate;
+    }
+    String res;
+    serializeJson(doc, res);
+    httpServer.send(200, "application/json", res);
+  });
+
+  httpServer.on("/api/devices", HTTP_POST, []() {
+    httpServer.send(200, "text/plain", "OK");
+  }, []() {
+    if (httpServer.hasArg("plain")) {
+      String body = httpServer.arg("plain");
+      StaticJsonDocument<512> doc;
+      DeserializationError error = deserializeJson(doc, body);
+      if (!error) {
+        handleDeviceUpdate(doc.as<JsonObject>());  // ✅ Fixed: Convert to JsonObject
+        httpServer.send(200, "application/json", "{\"status\":\"success\"}");
+      } else {
+        httpServer.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      }
+    } else {
+      httpServer.send(400, "application/json", "{\"error\":\"No body\"}");
+    }
+  });
+
+  httpServer.on("/api/sync", HTTP_POST, []() {
+    handleSyncRequest();
+  });
+
+  httpServer.on("/api/settings", HTTP_POST, []() {
+    handleSettingsSync();
+  });
+
+  httpServer.on("/api/heartbeat", HTTP_GET, []() {
+    sendHeartbeat();
+    httpServer.send(200, "text/plain", "Heartbeat sent");
+  });
+
+  httpServer.enableCORS(true);
+  httpServer.begin();
+  Serial.println("HTTP server started on port 80");
+}
+
+void setupMQTT() {
+  mqttClient.setServer(ANDROID_BROKER_IP, MQTT_PORT);
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    String t = String(topic);
+    String msg = String((char*)payload).substring(0, length);
+    Serial.printf("MQTT Rx: %s -> %s\n", t.c_str(), msg.c_str());
+
+    if (t.startsWith("homie/devices/") && t.endsWith("/control")) {
+      handleMQTTControl(t, msg);
+    } else if (t == "homie/system/sync") {
+      handleSyncMessage(msg);
+    } else if (t == "homie/system/settings") {
+      handleSettingsSyncMessage(msg);
+    } else if (t == "homie/system/request") {
+      handleSystemRequest(msg);
+    }
+  });
+  Serial.println("MQTT client configured to connect to Android broker");
+}
+
+void reconnectMQTT() {
+  Serial.print("Attempting MQTT connection to ");
+  Serial.print(ANDROID_BROKER_IP);
+  Serial.print(":");
+  Serial.println(MQTT_PORT);
+
+  if (mqttClient.connect(MQTT_CLIENT_ID)) {
+    Serial.println("MQTT connected to Android broker");
+    mqttClient.subscribe("homie/devices/+/control");
+    mqttClient.subscribe("homie/system/sync");
+    mqttClient.subscribe("homie/system/settings");
+    mqttClient.subscribe("homie/system/request");
+    publishAllDeviceStates();
+    publishHeartbeat();
+    publishPerformance();
+  } else {
+    Serial.print("MQTT connect failed, rc=");
+    Serial.println(mqttClient.state());
+    delay(5000);
+  }
+}
+
+void handleMQTTControl(String topic, String message) {
+  int start = topic.indexOf("/devices/") + 9;
+  int end = topic.indexOf("/control");
+  String deviceId = topic.substring(start, end);
+
+  StaticJsonDocument<256> doc;
+  deserializeJson(doc, message);
+
+  if (doc["action"] == "toggle") {
+    bool state = doc["state"];
+    for (int i = 0; i < NUM_DEVICES; i++) {
+      if (devices[i].id == deviceId) {
+        setDeviceState(i, state);
+        publishDeviceState(i);
+        sendDeviceStateUpdate(i);
+        break;
+      }
+    }
+  }
+}
+
+void setDeviceState(int i, bool state) {
+  devices[i].isActive = state;
+  devices[i].lastUpdate = millis();
+  digitalWrite(RELAY_PINS[i], state ? HIGH : LOW);
+  saveDeviceConfiguration();
+}
+
+void publishDeviceState(int i) {
+  StaticJsonDocument<256> doc;
+  doc["id"] = devices[i].id;
+  doc["isActive"] = devices[i].isActive;
+  doc["timestamp"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  String topic = "homie/devices/" + devices[i].id + "/state";
+  mqttClient.publish(topic.c_str(), payload.c_str());
+}
+
+void publishTemperatureUpdate(String deviceId, float temp) {
+  StaticJsonDocument<128> doc;
+  doc["id"] = deviceId;
+  doc["temperature"] = temp;
+  doc["timestamp"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish("homie/sensors/temperature", payload.c_str());
+}
+
+void publishAllDeviceStates() {
+  StaticJsonDocument<2048> doc;
+  JsonArray arr = doc.createNestedArray("devices");
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    JsonObject dev = arr.createNestedObject();
+    dev["id"] = devices[i].id;
+    dev["name"] = devices[i].name;
+    dev["type"] = devices[i].type;
+    dev["room"] = devices[i].room;
+    dev["isActive"] = devices[i].isActive;
+    dev["pin"] = devices[i].pin;
+    dev["temperature"] = devices[i].temperature;
+    dev["lastUpdate"] = devices[i].lastUpdate;
+  }
+  doc["timestamp"] = millis();
+  doc["source"] = "esp32";
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish("homie/system/all_states", payload.c_str());
+}
+
+void publishHeartbeat() {
+  StaticJsonDocument<128> doc;
+  doc["timestamp"] = millis();
+  doc["uptime"] = millis();
+  doc["source"] = "esp32";
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish("homie/system/heartbeat", payload.c_str());
+}
+
+void publishPerformance() {
+  StaticJsonDocument<256> doc;
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["sketch_size"] = ESP.getSketchSize();
+  doc["flash_size"] = ESP.getFlashChipSize();
+  doc["cpu_freq"] = ESP.getCpuFreqMHz();
+  doc["last_sync"] = millis();
+  doc["source"] = "esp32";
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish("homie/system/performance", payload.c_str());
+}
+
+void loadDeviceConfiguration() {
+  const char* names[] = {"Living Light", "Kitchen Light", "Bedroom Fan", "Bathroom Light", "Fan 1", "Fan 2", "Exhaust", "Garden"};
+  const char* types[] = {"light", "light", "fan", "light", "fan", "fan", "fan", "light"};
+  const char* rooms[] = {"Living", "Kitchen", "Bedroom", "Bathroom", "Living", "Bedroom", "Kitchen", "Garden"};
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    devices[i].id = "device_" + String(i);
+    devices[i].name = preferences.getString(("name_" + String(i)).c_str(), names[i]);
+    devices[i].type = preferences.getString(("type_" + String(i)).c_str(), types[i]);
+    devices[i].room = preferences.getString(("room_" + String(i)).c_str(), rooms[i]);
+    devices[i].isActive = preferences.getBool(("active_" + String(i)).c_str(), false);
+    devices[i].pin = RELAY_PINS[i];
+    devices[i].temperature = -127.0;
+    devices[i].lastUpdate = 0;
+
+    digitalWrite(RELAY_PINS[i], devices[i].isActive ? HIGH : LOW);
+  }
+  Serial.println("Config loaded");
+}
+
+void saveDeviceConfiguration() {
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    preferences.putString(("name_" + String(i)).c_str(), devices[i].name);
+    preferences.putString(("type_" + String(i)).c_str(), devices[i].type);
+    preferences.putString(("room_" + String(i)).c_str(), devices[i].room);
+    preferences.putBool(("active_" + String(i)).c_str(), devices[i].isActive);
+  }
+}
+
+void sendInitialData(uint8_t clientNum) {
+  DynamicJsonDocument doc(2048);
+  doc["type"] = "initial_devices";
+  JsonArray arr = doc.createNestedArray("devices");
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    JsonObject dev = arr.createNestedObject();
+    dev["id"] = devices[i].id;
+    dev["name"] = devices[i].name;
+    dev["type"] = devices[i].type;
+    dev["room"] = devices[i].room;
+    dev["isActive"] = devices[i].isActive;
+    dev["pin"] = devices[i].pin;
+    dev["temperature"] = devices[i].temperature;
+    dev["lastUpdate"] = devices[i].lastUpdate;
+  }
+  doc["timestamp"] = millis();
+
+  String res;
+  serializeJson(doc, res);
+  webSocket.sendTXT(clientNum, res);
+}
+
+void handleWebSocketMessage(uint8_t clientNum, char* payload, size_t length) {
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  if (error) {
+    Serial.println("WebSocket JSON parse error");
+    return;
+  }
+
+  const char* type = doc["type"];
+  if (strcmp(type, "toggle_device") == 0) {
+    String deviceId = doc["device_id"];
+    int state = doc["state"];
+    toggleDeviceById(deviceId, state == 1);
+  } else if (strcmp(type, "update_device") == 0) {
+    handleDeviceUpdate(doc.as<JsonObject>());  // ✅ Fixed
+  } else if (strcmp(type, "get_initial_data") == 0) {
+    sendInitialData(clientNum);
+  } else if (strcmp(type, "sync_request") == 0) {
+    publishAllDeviceStates();
+    sendAllDeviceStates();
+  }
+}
+
+void toggleDeviceById(String deviceId, bool state) {
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    if (devices[i].id == deviceId) {
+      setDeviceState(i, state);
+      publishDeviceState(i);
+      sendDeviceStateUpdate(i);
+      break;
+    }
+  }
+}
+
+void handleDeviceUpdate(JsonObject doc) {  // ✅ Changed: pass by value
+  String deviceId = doc["device_id"];
+  const char* name = doc["name"];
+  const char* type = doc["type"];
+  const char* room = doc["room"];
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    if (devices[i].id == deviceId) {
+      devices[i].name = String(name);
+      devices[i].type = String(type);
+      devices[i].room = String(room);
+      saveDeviceConfiguration();
+      sendDeviceStateUpdate(i);
+      break;
+    }
+  }
+}
+
+void sendDeviceStateUpdate(int i) {
+  DynamicJsonDocument doc(256);
+  doc["type"] = "device_state";
+  doc["id"] = devices[i].id;
+  doc["isActive"] = devices[i].isActive;
+  doc["timestamp"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.broadcastTXT(payload);
+}
+
+void sendTemperatureUpdate(String deviceId, float temp) {
+  DynamicJsonDocument doc(128);
+  doc["type"] = "temperature";
+  doc["id"] = deviceId;
+  doc["temperature"] = temp;
+  doc["timestamp"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.broadcastTXT(payload);
+}
+
+void sendAllDeviceStates() {
+  DynamicJsonDocument doc(2048);
+  doc["type"] = "all_states";
+  JsonArray arr = doc.createNestedArray("devices");
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    JsonObject dev = arr.createNestedObject();
+    dev["id"] = devices[i].id;
+    dev["name"] = devices[i].name;
+    dev["isActive"] = devices[i].isActive;
+    dev["temperature"] = devices[i].temperature;
+  }
+  doc["timestamp"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.broadcastTXT(payload);
+}
+
+void sendHeartbeat() {
+  DynamicJsonDocument doc(128);
+  doc["type"] = "heartbeat";
+  doc["timestamp"] = millis();
+  doc["source"] = "esp32";
+
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.broadcastTXT(payload);
+}
+
+void handleSyncMessage(String message) {
+  Serial.println("Sync message received from Android");
+}
+
+void handleSettingsSyncMessage(String message) {
+  Serial.println("Settings sync message received from Android");
+}
+
+void handleSystemRequest(String message) {
+  StaticJsonDocument<256> doc;
+  deserializeJson(doc, message);
+  if (doc["action"] == "get_all_states") {
+    publishAllDeviceStates();
+  }
+}
+
+void handleSyncRequest() {
+  if (httpServer.hasArg("plain")) {
+    String body = httpServer.arg("plain");
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, body);
+    if (!error) {
+      publishAllDeviceStates();
+      httpServer.send(200, "application/json", "{\"status\":\"sync_initiated\"}");
+    } else {
+      httpServer.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    }
+  } else {
+    httpServer.send(400, "application/json", "{\"error\":\"No body\"}");
+  }
+}
+
+void handleSettingsSync() {
+  if (httpServer.hasArg("plain")) {
+    String body = httpServer.arg("plain");
+    Serial.println("Settings sync received: " + body);
+    httpServer.send(200, "application/json", "{\"status\":\"settings_applied\"}");
+  } else {
+    httpServer.send(400, "application/json", "{\"error\":\"No body\"}");
+  }
+}
+
+void blinkStatusLED(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(STATUS_LED, HIGH);
+    delay(200);
+    digitalWrite(STATUS_LED, LOW);
+    delay(200);
+  }
+}

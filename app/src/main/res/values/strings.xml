@@ -1,0 +1,35 @@
+<resources>
+    <string name="app_name">Homie</string>
+    <string name="title_home">Home</string>
+    <string name="title_devices">Devices</string>
+    <string name="title_rooms">Rooms</string>
+    
+    <!-- Other strings -->     
+    <string name="welcome_message">Welcome Home</string>
+    <string name="welcome_subtitle">Your smart home is ready for your command.</string>
+    <string name="active_devices">Active Devices</string>
+    <string name="temperature_readings">Temperature Readings</string>
+    <string name="see_all">See all</string>
+    <string name="filter_all">All</string>
+    <string name="filter_active">Active</string>
+    <string name="filter_inactive">Inactive</string>
+    <string name="device_on">On</string>
+    <string name="device_off">Off</string>
+    <string name="voice_control">Voice Control</string>
+    <string name="search">Search</string>
+    
+    <!-- Preference Titles -->
+    <string name="messages_header">Messages</string>
+    <string name="sync_header">Sync</string>
+
+    <!-- Messages Preferences -->
+    <string name="signature_title">Your signature</string>
+    <string name="reply_title">Default reply action</string>
+
+    <!-- Sync Preferences -->
+    <string name="sync_title">Sync email periodically</string>
+    <string name="attachment_title">Download incoming attachments</string>
+    <string name="attachment_summary_on">Automatically download attachments for incoming emails
+    </string>
+    <string name="attachment_summary_off">Only download attachments when manually requested</string>
+</resources>

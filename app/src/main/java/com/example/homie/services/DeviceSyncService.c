@@ -1,0 +1,526 @@
+// DeviceSyncService.java
+package com.example.homie.services;
+
+import android.app.Service;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.content.SharedPreferences;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.os.Binder;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.util.Log;
+import androidx.annotation.Nullable;
+import com.example.homie.model.Device;
+import com.example.homie.services.ESP32Service;
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import org.eclipse.paho.client.mqttv3.*;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+
+public class DeviceSyncService extends Service {
+    private static final String TAG = "DeviceSyncService";
+    private static final long SYNC_INTERVAL = 15000; // 15 seconds
+    private static final String ESP32_SSID = "SmartHome_ESP32";
+
+    // MQTT Topics aligned with HomieESP32.ino
+    private static final String TOPIC_DEVICE_SYNC = "homie/system/sync";
+    private static final String TOPIC_SYNC_ACK = "homie/system/sync_ack";
+    private static final String TOPIC_DEVICE_STATE = "homie/devices/+/state";
+    private static final String TOPIC_PERFORMANCE = "homie/system/performance";
+    private static final String TOPIC_HEARTBEAT = "homie/system/heartbeat";
+    private static final String TOPIC_ALL_STATES = "homie/system/all_states";
+    private static final String TOPIC_SETTINGS_SYNC = "homie/system/settings";
+
+    private final IBinder binder = new DeviceSyncBinder();
+    private Handler syncHandler;
+    private Runnable syncRunnable;
+    private Executor executor;
+    private SharedPreferences preferences;
+    private MqttClient mqttClient;
+    private Gson gson;
+    private ConnectivityManager connectivityManager;
+    private Network esp32Network;
+    private boolean networkBound = false;
+
+    // Reference to ESP32Service for shared network binding
+    private ESP32Service esp32Service;
+    private boolean brokerReady = false;
+
+    public class DeviceSyncBinder extends Binder {
+        public DeviceSyncService getService() {
+            return DeviceSyncService.this;
+        }
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        Log.d(TAG, "DeviceSyncService created");
+
+        syncHandler = new Handler(Looper.getMainLooper());
+        executor = Executors.newFixedThreadPool(2);
+        preferences = getSharedPreferences("device_sync", MODE_PRIVATE);
+        gson = new Gson();
+        connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+
+        setupSyncRunnable();
+        requestNetworkBinding();
+    }
+
+    private void requestNetworkBinding() {
+        NetworkRequest.Builder builder = new NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
+        }
+
+        NetworkRequest request = builder.build();
+
+        connectivityManager.registerNetworkCallback(request, new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                Log.d(TAG, "Network available for DeviceSyncService");
+                if (isESP32Network()) {
+                    esp32Network = network;
+                    bindToESP32Network(network);
+                }
+            }
+
+            @Override
+            public void onCapabilitiesChanged(Network network, NetworkCapabilities networkCapabilities) {
+                if (esp32Network != null && esp32Network.equals(network)) {
+                    Log.d(TAG, "ESP32 network capabilities changed");
+                }
+            }
+
+            @Override
+            public void onLost(Network network) {
+                if (esp32Network != null && esp32Network.equals(network)) {
+                    Log.w(TAG, "ESP32 network lost");
+                    networkBound = false;
+                    esp32Network = null;
+                    stopPeriodicSync();
+                    brokerReady = false;
+                    if (mqttClient != null && mqttClient.isConnected()) {
+                        try {
+                            mqttClient.disconnect();
+                            mqttClient.close();
+                        } catch (Exception e) {
+                            Log.e(TAG, "Error disconnecting MQTT", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    private boolean isESP32Network() {
+        android.net.wifi.WifiManager wifiManager = (android.net.wifi.WifiManager) getSystemService(WIFI_SERVICE);
+        android.net.wifi.WifiInfo wifiInfo = wifiManager.getConnectionInfo();
+        return wifiInfo != null && wifiInfo.getSSID() != null &&
+                ESP32_SSID.equals(wifiInfo.getSSID().replace("\"", ""));
+    }
+
+    private void bindToESP32Network(Network network) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                boolean success = connectivityManager.bindProcessToNetwork(network);
+                if (success) {
+                    networkBound = true;
+                    Log.d(TAG, "Successfully bound to ESP32 network");
+                    connectMQTT();
+                } else {
+                    Log.e(TAG, "Failed to bind to ESP32 network");
+                }
+            } else {
+                ConnectivityManager.setProcessDefaultNetwork(network);
+                networkBound = true;
+                Log.d(TAG, "Set ESP32 as default network (legacy method)");
+                connectMQTT();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to bind to ESP32 network", e);
+            networkBound = false;
+        }
+    }
+
+    private void connectMQTT() {
+        if (!networkBound) {
+            Log.w(TAG, "Cannot connect MQTT - network not bound");
+            return;
+        }
+
+        executor.execute(() -> {
+            try {
+                // Test connectivity to ESP32 broker
+                try (Socket socket = esp32Network.getSocketFactory().createSocket()) {
+                    socket.connect(new InetSocketAddress("192.168.4.1", 1883), 3000);
+                    Log.d(TAG, "Successfully reached ESP32 MQTT broker at 192.168.4.1:1883");
+                }
+
+                MemoryPersistence persistence = new MemoryPersistence();
+                mqttClient = new MqttClient("tcp://192.168.4.1:1883", "DeviceSyncClient_" + System.currentTimeMillis(),
+                        persistence);
+
+                MqttConnectOptions options = new MqttConnectOptions();
+                options.setCleanSession(true);
+                options.setAutomaticReconnect(false);
+                options.setKeepAliveInterval(30);
+                options.setConnectionTimeout(10);
+                if (esp32Network != null) {
+                    options.setSocketFactory(esp32Network.getSocketFactory());
+                }
+
+                mqttClient.setCallback(new MqttCallback() {
+                    @Override
+                    public void connectionLost(Throwable cause) {
+                        Log.w(TAG, "MQTT connection lost", cause);
+                    }
+
+                    @Override
+                    public void messageArrived(String topic, MqttMessage message) throws Exception {
+                        handleMqttMessage(topic, new String(message.getPayload()));
+                    }
+
+                    @Override
+                    public void deliveryComplete(IMqttDeliveryToken token) {
+                        Log.d(TAG, "MQTT message delivery complete");
+                    }
+                });
+
+                mqttClient.connect(options);
+                mqttClient.subscribe(TOPIC_SYNC_ACK, 1);
+                mqttClient.subscribe(TOPIC_DEVICE_STATE, 1);
+                mqttClient.subscribe(TOPIC_HEARTBEAT, 1);
+                mqttClient.subscribe(TOPIC_ALL_STATES, 1);
+                Log.d(TAG, "MQTT connected and subscribed to topics");
+
+                // Request initial device states
+                Map<String, Object> request = new HashMap<>();
+                request.put("action", "get_all_states");
+                request.put("timestamp", System.currentTimeMillis());
+                String message = gson.toJson(request);
+                mqttClient.publish("homie/system/request", message.getBytes(), 1, false);
+
+                // Mark broker as ready
+                brokerReady = true;
+                if (esp32Service != null) {
+                    Log.d(TAG, "Broker ready, starting periodic sync");
+                    startPeriodicSync();
+                }
+
+            } catch (Exception e) {
+                Log.e(TAG, "MQTT connection failed", e);
+            }
+        });
+    }
+
+    private void handleMqttMessage(String topic, String message) {
+        try {
+            Log.d(TAG, "Received MQTT message on topic: " + topic + ", payload: " + message);
+            JsonObject json = JsonParser.parseString(message).getAsJsonObject();
+
+            if (topic.equals(TOPIC_SYNC_ACK)) {
+                Log.d(TAG, "Sync acknowledgment received: " + json.get("type").getAsString());
+            } else if (topic.startsWith("homie/devices/") && topic.endsWith("/state")) {
+                String deviceId = topic.split("/")[2];
+                boolean isActive = json.get("isActive").getAsBoolean();
+                long timestamp = json.get("timestamp").getAsLong();
+                String source = json.get("source").getAsString();
+
+                Map<String, Object> deviceData = new HashMap<>();
+                deviceData.put("id", deviceId);
+                deviceData.put("isActive", isActive);
+                deviceData.put("timestamp", timestamp);
+                deviceData.put("source", source);
+
+                SharedPreferences.Editor editor = preferences.edit();
+                editor.putString("device_" + deviceId, gson.toJson(deviceData));
+                editor.apply();
+                Log.d(TAG, "Updated device state for " + deviceId + ": isActive=" + isActive);
+            } else if (topic.equals(TOPIC_HEARTBEAT)) {
+                Log.d(TAG, "Heartbeat received from ESP32: " + json.toString());
+            } else if (topic.equals(TOPIC_ALL_STATES)) {
+                if (json.has("devices")) {
+                    for (JsonElement deviceElement : json.getAsJsonArray("devices")) {
+                        JsonObject deviceData = deviceElement.getAsJsonObject();
+                        Map<String, Object> deviceMap = new HashMap<>();
+                        deviceMap.put("id", deviceData.get("id").getAsString());
+                        deviceMap.put("name", deviceData.get("name").getAsString());
+                        deviceMap.put("type", deviceData.get("type").getAsString());
+                        deviceMap.put("room", deviceData.get("room").getAsString());
+                        deviceMap.put("isActive", deviceData.get("isActive").getAsBoolean());
+                        deviceMap.put("pin", deviceData.get("pin").getAsInt());
+                        deviceMap.put("temperature", deviceData.get("temperature").getAsDouble());
+                        deviceMap.put("lastUpdate", deviceData.get("lastUpdate").getAsLong());
+
+                        SharedPreferences.Editor editor = preferences.edit();
+                        editor.putString("device_" + deviceData.get("id").getAsString(), gson.toJson(deviceMap));
+                        editor.apply();
+                    }
+                    Log.d(TAG, "Initial device states received and cached");
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error handling MQTT message", e);
+        }
+    }
+
+    private void setupSyncRunnable() {
+        syncRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (networkBound && mqttClient != null && mqttClient.isConnected()) {
+                    performSync();
+                } else {
+                    Log.w(TAG, "Skipping sync - MQTT not connected or network not bound");
+                }
+                syncHandler.postDelayed(this, SYNC_INTERVAL);
+            }
+        };
+    }
+
+    public void startPeriodicSync() {
+        if (networkBound && mqttClient != null && mqttClient.isConnected()) {
+            syncHandler.post(syncRunnable);
+            Log.d(TAG, "Periodic sync started");
+        } else {
+            Log.w(TAG, "Cannot start sync - MQTT not connected or network not bound");
+        }
+    }
+
+    public void stopPeriodicSync() {
+        syncHandler.removeCallbacks(syncRunnable);
+        Log.d(TAG, "Periodic sync stopped");
+    }
+
+    public void performSync() {
+        executor.execute(() -> {
+            try {
+                syncDeviceStates();
+                syncSettings();
+                trackDevicePerformance();
+                Log.d(TAG, "Sync completed successfully");
+            } catch (Exception e) {
+                Log.e(TAG, "Sync failed", e);
+            }
+        });
+    }
+
+    private void syncDeviceStates() {
+        try {
+            if (!networkBound || mqttClient == null || !mqttClient.isConnected()) {
+                Log.w(TAG, "Cannot sync device states - MQTT not ready");
+                return;
+            }
+
+            Map<String, ?> storedDevices = preferences.getAll();
+            Map<String, Object> deviceStates = new HashMap<>();
+
+            for (Map.Entry<String, ?> entry : storedDevices.entrySet()) {
+                if (entry.getKey().startsWith("device_")) {
+                    String deviceId = entry.getKey().substring(7);
+                    deviceStates.put(deviceId, gson.fromJson(entry.getValue().toString(), Map.class));
+                }
+            }
+
+            if (deviceStates.isEmpty()) {
+                // Request initial device states
+                Map<String, Object> request = new HashMap<>();
+                request.put("action", "get_all_states");
+                request.put("timestamp", System.currentTimeMillis());
+                String message = gson.toJson(request);
+                mqttClient.publish("homie/system/request", message.getBytes(), 1, false);
+                Log.d(TAG, "Requested initial device states from ESP32");
+                return;
+            }
+
+            if (!deviceStates.isEmpty()) {
+                Map<String, Object> syncMessage = new HashMap<>();
+                syncMessage.put("type", "device_sync");
+                syncMessage.put("devices", deviceStates);
+                syncMessage.put("timestamp", System.currentTimeMillis());
+
+                String message = gson.toJson(syncMessage);
+                mqttClient.publish(TOPIC_DEVICE_SYNC, message.getBytes(), 1, false);
+                Log.d(TAG, "Device states synced to ESP32: " + deviceStates.size() + " devices");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error syncing device states", e);
+        }
+    }
+
+    private void syncSettings() {
+        try {
+            if (!networkBound || mqttClient == null || !mqttClient.isConnected()) {
+                Log.w(TAG, "Cannot sync settings - MQTT not ready");
+                return;
+            }
+
+            SharedPreferences notificationPrefs = getSharedPreferences("notification_prefs", MODE_PRIVATE);
+            SharedPreferences securityPrefs = getSharedPreferences("security_prefs", MODE_PRIVATE);
+
+            Map<String, Object> settings = new HashMap<>();
+            settings.put("device_alerts", notificationPrefs.getBoolean("device_alerts", true));
+            settings.put("security_alerts", notificationPrefs.getBoolean("security_alerts", true));
+            settings.put("smart_suggestions", notificationPrefs.getBoolean("smart_suggestions", false));
+            settings.put("two_factor_auth", securityPrefs.getBoolean("two_factor_auth", false));
+            settings.put("data_collection", securityPrefs.getBoolean("data_collection", true));
+
+            Map<String, Object> syncMessage = new HashMap<>();
+            syncMessage.put("type", "settings");
+            syncMessage.put("data", settings);
+            syncMessage.put("timestamp", System.currentTimeMillis());
+
+            String message = gson.toJson(syncMessage);
+            mqttClient.publish(TOPIC_DEVICE_SYNC, message.getBytes(), 1, false);
+            Log.d(TAG, "Settings synced with ESP32");
+        } catch (Exception e) {
+            Log.e(TAG, "Error syncing settings", e);
+        }
+    }
+
+    private void trackDevicePerformance() {
+        try {
+            if (!networkBound || mqttClient == null || !mqttClient.isConnected()) {
+                Log.w(TAG, "Cannot track performance - MQTT not ready");
+                return;
+            }
+
+            Map<String, Object> performance = new HashMap<>();
+            performance.put("last_sync", System.currentTimeMillis());
+            performance.put("sync_interval", SYNC_INTERVAL);
+            performance.put("service_uptime", System.currentTimeMillis() - getServiceStartTime());
+            performance.put("network_bound", networkBound);
+
+            String message = gson.toJson(performance);
+            mqttClient.publish(TOPIC_PERFORMANCE, message.getBytes(), 1, false);
+
+            SharedPreferences.Editor editor = preferences.edit();
+            editor.putLong("last_performance_check", System.currentTimeMillis());
+            editor.apply();
+            Log.d(TAG, "Device performance tracked and sent to ESP32");
+        } catch (Exception e) {
+            Log.e(TAG, "Error tracking device performance", e);
+        }
+    }
+
+    private long getServiceStartTime() {
+        return preferences.getLong("service_start_time", System.currentTimeMillis());
+    }
+
+    public void syncDeviceToESP32(Device device) {
+        if (!networkBound || mqttClient == null || !mqttClient.isConnected()) {
+            Log.w(TAG, "Cannot sync device - MQTT not ready");
+            return;
+        }
+
+        executor.execute(() -> {
+            try {
+                Map<String, Object> deviceData = new HashMap<>();
+                deviceData.put("id", device.getId());
+                deviceData.put("name", device.getName());
+                deviceData.put("type", device.getType());
+                deviceData.put("room", device.getRoom());
+                deviceData.put("isActive", device.isActive());
+                deviceData.put("pin", device.getPin());
+                deviceData.put("timestamp", System.currentTimeMillis());
+
+                String topic = "homie/devices/" + device.getId() + "/sync";
+                String message = gson.toJson(deviceData);
+                mqttClient.publish(topic, message.getBytes(), 1, false);
+
+                SharedPreferences.Editor editor = preferences.edit();
+                editor.putString("device_" + device.getId(), gson.toJson(deviceData));
+                editor.apply();
+                Log.d(TAG, "Device " + device.getName() + " synced to ESP32");
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to sync device to ESP32", e);
+            }
+        });
+    }
+
+    public void syncSettingsToESP32(Map<String, Object> settings) {
+        if (!networkBound || mqttClient == null || !mqttClient.isConnected()) {
+            Log.w(TAG, "Cannot sync settings - MQTT not ready");
+            return;
+        }
+
+        executor.execute(() -> {
+            try {
+                settings.put("timestamp", System.currentTimeMillis());
+                settings.put("source", "android_sync_service");
+
+                String message = gson.toJson(settings);
+                mqttClient.publish(TOPIC_DEVICE_SYNC, message.getBytes(), 1, false);
+                Log.d(TAG, "Settings synced to ESP32");
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to sync settings to ESP32", e);
+            }
+        });
+    }
+
+    public boolean isNetworkBound() {
+        return networkBound;
+    }
+
+    /**
+     * Called by MainActivity to inject ESP32Service reference
+     */
+    public void setEsp32Service(ESP32Service service) {
+        this.esp32Service = service;
+        this.brokerReady = (service != null);
+        if (brokerReady && networkBound) {
+            startPeriodicSync();
+        }
+    }
+
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) {
+        SharedPreferences.Editor editor = preferences.edit();
+        editor.putLong("service_start_time", System.currentTimeMillis());
+        editor.apply();
+        return binder;
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        stopPeriodicSync();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && networkBound) {
+            connectivityManager.bindProcessToNetwork(null);
+        }
+
+        if (mqttClient != null) {
+            try {
+                if (mqttClient.isConnected()) {
+                    mqttClient.disconnect();
+                    mqttClient.close();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error cleaning up MQTT connection", e);
+            }
+        }
+        Log.d(TAG, "DeviceSyncService destroyed");
+    }
+}

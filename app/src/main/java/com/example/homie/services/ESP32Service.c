@@ -1,0 +1,671 @@
+// ESP32Service.java
+package com.example.homie.services;
+
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
+import android.os.Binder;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.util.Log;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.lifecycle.MutableLiveData;
+
+import com.example.homie.model.Device;
+import com.example.homie.model.Room;
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import org.eclipse.paho.client.mqttv3.*;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class ESP32Service extends Service {
+    private static final String TAG = "ESP32Service";
+
+    private static final String ESP32_SSID = "SmartHome_ESP32";
+    private static final String ESP32_BROKER_IP = "192.168.4.1";
+    private static final int MQTT_PORT = 1883;
+    private static final String MQTT_BROKER_URL = "tcp://" + ESP32_BROKER_IP + ":" + MQTT_PORT;
+    private static final String CLIENT_ID = "AndroidHomie_" + System.currentTimeMillis();
+
+    private static final String TOPIC_DEVICE_CONTROL = "homie/devices/+/control";
+    private static final String TOPIC_DEVICE_STATE = "homie/devices/+/state";
+    private static final String TOPIC_TEMPERATURE = "homie/sensors/temperature";
+    private static final String TOPIC_SYNC = "homie/system/sync";
+    private static final String TOPIC_SETTINGS_SYNC = "homie/system/settings";
+    private static final String TOPIC_HEARTBEAT = "homie/system/heartbeat";
+    private static final String TOPIC_INITIAL_REQUEST = "homie/system/request";
+
+    private MqttClient esp32MqttClient;
+    private WifiManager wifiManager;
+    private ConnectivityManager connectivityManager;
+    private SharedPreferences preferences;
+    private Gson gson;
+    private ExecutorService executorService;
+    private Handler mainHandler;
+
+    private Network esp32Network;
+    private boolean networkBound = false;
+
+    private final AtomicInteger connectionAttempts = new AtomicInteger(0);
+    private final AtomicLong lastSuccessfulConnection = new AtomicLong(0);
+    private final AtomicLong lastHeartbeat = new AtomicLong(0);
+    private Handler retryHandler;
+    private Handler healthCheckHandler;
+    private Runnable retryRunnable;
+    private Runnable healthCheckRunnable;
+
+    private final MutableLiveData<Boolean> esp32Connected = new MutableLiveData<>(false);
+    private final MutableLiveData<Boolean> wifiConnected = new MutableLiveData<>(false);
+    private final MutableLiveData<Boolean> mqttConnected = new MutableLiveData<>(false);
+    private final MutableLiveData<List<Device>> deviceUpdates = new MutableLiveData<>();
+    private final MutableLiveData<Map<String, Float>> temperatureData = new MutableLiveData<>();
+    private final MutableLiveData<Boolean> syncInProgress = new MutableLiveData<>(false);
+    private final MutableLiveData<Integer> connectionStatus = new MutableLiveData<>(0);
+
+    private final Map<String, Device> deviceCache = new HashMap<>();
+    private final List<Room> roomCache = new ArrayList<>();
+
+    public class ESP32Binder extends Binder {
+        public ESP32Service getService() {
+            return ESP32Service.this;
+        }
+    }
+
+    private final IBinder binder = new ESP32Binder();
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        Log.d(TAG, "ESP32Service created");
+        initializeService();
+        requestNetworkBinding();
+    }
+
+    private void initializeService() {
+        wifiManager = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+        connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        preferences = getSharedPreferences("homie_esp32", MODE_PRIVATE);
+        gson = new Gson();
+        executorService = Executors.newCachedThreadPool();
+        mainHandler = new Handler(Looper.getMainLooper());
+        retryHandler = new Handler(Looper.getMainLooper());
+        healthCheckHandler = new Handler(Looper.getMainLooper());
+
+        setupRetryMechanism();
+        setupHealthCheck();
+        loadCachedData();
+    }
+
+    private void requestNetworkBinding() {
+        NetworkRequest.Builder builder = new NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
+        }
+
+        NetworkRequest request = builder.build();
+
+        connectivityManager.registerNetworkCallback(request, new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(@NonNull Network network) {
+                Log.d(TAG, "Network available");
+                if (isConnectedToESP32()) {
+                    esp32Network = network;
+                    bindToESP32Network(network);
+                }
+            }
+
+            @Override
+            public void onLost(@NonNull Network network) {
+                if (network.equals(esp32Network)) {
+                    Log.w(TAG, "ESP32 network lost");
+                    networkBound = false;
+                    esp32Network = null;
+                    mainHandler.post(() -> {
+                        wifiConnected.setValue(false);
+                        esp32Connected.setValue(false);
+                        mqttConnected.setValue(false);
+                        connectionStatus.setValue(0);
+                    });
+                    startRetryMechanism();
+                }
+            }
+
+            @Override
+            public void onCapabilitiesChanged(@NonNull Network network,
+                    @NonNull NetworkCapabilities networkCapabilities) {
+                if (network.equals(esp32Network)) {
+                    Log.d(TAG, "ESP32 network capabilities changed");
+                }
+            }
+        });
+    }
+
+    private boolean isConnectedToESP32() {
+        android.net.wifi.WifiInfo wifiInfo = wifiManager.getConnectionInfo();
+        return wifiInfo != null && wifiInfo.getSSID() != null &&
+                ESP32_SSID.equals(wifiInfo.getSSID().replace("\"", ""));
+    }
+
+    private void bindToESP32Network(Network network) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                boolean success = connectivityManager.bindProcessToNetwork(network);
+                if (success) {
+                    networkBound = true;
+                    esp32Network = network;
+                    Log.d(TAG, "Successfully bound to ESP32 network");
+                    mainHandler.post(() -> wifiConnected.setValue(true));
+                    connectToESP32Broker();
+                } else {
+                    Log.e(TAG, "Failed to bind to ESP32 network");
+                    startRetryMechanism();
+                }
+            } else {
+                ConnectivityManager.setProcessDefaultNetwork(network);
+                networkBound = true;
+                esp32Network = network;
+                Log.d(TAG, "Set ESP32 as default network (legacy method)");
+                mainHandler.post(() -> wifiConnected.setValue(true));
+                connectToESP32Broker();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error binding to ESP32 network", e);
+            networkBound = false;
+            startRetryMechanism();
+        }
+    }
+
+    private void connectToESP32Broker() {
+        executorService.execute(() -> {
+            try {
+                try (Socket socket = esp32Network.getSocketFactory().createSocket()) {
+                    socket.connect(new InetSocketAddress(ESP32_BROKER_IP, MQTT_PORT), 3000);
+                    Log.d(TAG, "Reached ESP32 MQTT broker at " + ESP32_BROKER_IP);
+                }
+
+                MemoryPersistence persistence = new MemoryPersistence();
+                esp32MqttClient = new MqttClient(MQTT_BROKER_URL, CLIENT_ID, persistence);
+
+                MqttConnectOptions options = new MqttConnectOptions();
+                options.setCleanSession(true);
+                options.setConnectionTimeout(10);
+                options.setKeepAliveInterval(30);
+                if (esp32Network != null) {
+                    options.setSocketFactory(esp32Network.getSocketFactory());
+                }
+
+                esp32MqttClient.setCallback(new MqttCallback() {
+                    @Override
+                    public void connectionLost(Throwable cause) {
+                        Log.w(TAG, "MQTT connection lost", cause);
+                        mainHandler.post(() -> {
+                            mqttConnected.setValue(false);
+                            if (Boolean.TRUE.equals(esp32Connected.getValue())) {
+                                esp32Connected.setValue(false);
+                                connectionStatus.setValue(0);
+                                startRetryMechanism();
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void messageArrived(String topic, MqttMessage message) throws Exception {
+                        Log.d(TAG, "Rx: " + topic);
+                        handleMqttMessage(topic, new String(message.getPayload()));
+                    }
+
+                    @Override
+                    public void deliveryComplete(IMqttDeliveryToken token) {
+                        Log.d(TAG, "Delivery complete");
+                    }
+                });
+
+                esp32MqttClient.connect(options);
+                esp32MqttClient.subscribe(TOPIC_DEVICE_STATE);
+                esp32MqttClient.subscribe(TOPIC_TEMPERATURE);
+                esp32MqttClient.subscribe(TOPIC_SYNC);
+                esp32MqttClient.subscribe(TOPIC_SETTINGS_SYNC);
+                esp32MqttClient.subscribe(TOPIC_HEARTBEAT);
+                esp32MqttClient.subscribe("homie/system/all_states");
+
+                mainHandler.post(() -> {
+                    mqttConnected.setValue(true);
+                    esp32Connected.setValue(true);
+                    connectionStatus.setValue(2);
+                    Toast.makeText(ESP32Service.this, "Connected to ESP32 MQTT Broker", Toast.LENGTH_SHORT).show();
+                });
+
+                lastSuccessfulConnection.set(System.currentTimeMillis());
+                connectionAttempts.set(0);
+                stopRetryMechanism();
+                sendInitialRequest();
+                startPeriodicSync();
+                sendHeartbeat();
+
+            } catch (Exception e) {
+                Log.e(TAG, "MQTT connection failed: " + e.getMessage(), e);
+                mainHandler.post(() -> connectionStatus.setValue(0));
+                startRetryMechanism();
+            }
+        });
+    }
+
+    private void sendInitialRequest() {
+        try {
+            Map<String, Object> req = new HashMap<>();
+            req.put("action", "get_all_states");
+            req.put("timestamp", System.currentTimeMillis());
+            String payload = gson.toJson(req);
+            esp32MqttClient.publish(TOPIC_INITIAL_REQUEST, payload.getBytes(), 1, false);
+        } catch (Exception e) {
+            Log.e(TAG, "Send initial request failed", e);
+        }
+    }
+
+    private void handleMqttMessage(String topic, String message) {
+        try {
+            JsonObject data = JsonParser.parseString(message).getAsJsonObject();
+            if (topic.startsWith("homie/devices/") && topic.endsWith("/state")) {
+                handleDeviceStateUpdate(data);
+            } else if (topic.equals(TOPIC_TEMPERATURE)) {
+                handleTemperatureUpdate(data);
+            } else if (topic.equals("homie/system/all_states")) {
+                handleInitialDevices(data);
+            } else if (topic.equals(TOPIC_SYNC)) {
+                handleSyncMessage(data);
+            } else if (topic.equals(TOPIC_SETTINGS_SYNC)) {
+                handleSettingsSyncMessage(data);
+            } else if (topic.equals(TOPIC_HEARTBEAT)) {
+                lastHeartbeat.set(System.currentTimeMillis());
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error handling MQTT message", e);
+        }
+    }
+
+    private void handleDeviceStateUpdate(JsonObject data) {
+        String deviceId = data.get("id").getAsString();
+        boolean isActive = data.get("isActive").getAsBoolean();
+        long timestamp = data.has("timestamp") ? data.get("timestamp").getAsLong() : System.currentTimeMillis();
+
+        Device device = deviceCache.get(deviceId);
+        if (device != null) {
+            device.setActive(isActive);
+            device.setLastUpdate(timestamp);
+            if (data.has("temperature")) {
+                device.setTemperature(data.get("temperature").getAsDouble());
+            }
+            deviceCache.put(deviceId, device);
+            saveDeviceToPreferences(device);
+            mainHandler.post(() -> deviceUpdates.setValue(new ArrayList<>(deviceCache.values())));
+        }
+    }
+
+    private void handleTemperatureUpdate(JsonObject data) {
+        Map<String, Float> temperatures = new HashMap<>();
+        if (data.has("sensors")) {
+            JsonObject sensors = data.getAsJsonObject("sensors");
+            for (String key : sensors.keySet()) {
+                temperatures.put(key, sensors.get(key).getAsFloat());
+            }
+        }
+        mainHandler.post(() -> temperatureData.setValue(temperatures));
+        saveTemperatureData(temperatures);
+    }
+
+    private void handleInitialDevices(JsonObject data) {
+        if (data.has("devices")) {
+            deviceCache.clear();
+            for (JsonElement el : data.getAsJsonArray("devices")) {
+                JsonObject obj = el.getAsJsonObject();
+                Device device = new Device(
+                        obj.get("id").getAsString(),
+                        obj.get("name").getAsString(),
+                        obj.get("type").getAsString(),
+                        obj.get("room").getAsString(),
+                        obj.get("isActive").getAsBoolean());
+                if (obj.has("pin")) {
+                    device.setPin(obj.get("pin").getAsInt());
+                }
+                if (obj.has("temperature")) {
+                    device.setTemperature(obj.get("temperature").getAsDouble());
+                }
+                if (obj.has("lastUpdate")) {
+                    device.setLastUpdate(obj.get("lastUpdate").getAsLong());
+                }
+                deviceCache.put(device.getId(), device);
+                saveDeviceToPreferences(device);
+            }
+            mainHandler.post(() -> deviceUpdates.setValue(new ArrayList<>(deviceCache.values())));
+        }
+        syncDataWithESP32();
+    }
+
+    private void handleSyncMessage(JsonObject data) {
+        Log.d(TAG, "Sync message received from ESP32");
+        mainHandler.post(() -> syncInProgress.setValue(false));
+    }
+
+    private void handleSettingsSyncMessage(JsonObject data) {
+        Log.d(TAG, "Settings sync message received from ESP32");
+    }
+
+    public void toggleDevice(String deviceId, boolean state) {
+        if (!networkBound) {
+            Log.w(TAG, "Cannot toggle device - network not bound");
+            return;
+        }
+
+        executorService.execute(() -> {
+            try {
+                Map<String, Object> command = new HashMap<>();
+                command.put("action", "toggle");
+                command.put("state", state);
+                command.put("timestamp", System.currentTimeMillis());
+
+                String topic = "homie/devices/" + deviceId + "/control";
+                String message = gson.toJson(command);
+
+                if (esp32MqttClient != null && esp32MqttClient.isConnected()) {
+                    esp32MqttClient.publish(topic, message.getBytes(), 1, false);
+                    Log.d(TAG, "Sent MQTT toggle command: " + deviceId + " -> " + state);
+                }
+
+            } catch (Exception e) {
+                Log.e(TAG, "Error toggling device: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    public void syncDataWithESP32() {
+        if (!networkBound) {
+            Log.w(TAG, "Cannot sync data - network not bound");
+            return;
+        }
+
+        executorService.execute(() -> {
+            try {
+                mainHandler.post(() -> syncInProgress.setValue(true));
+
+                Map<String, Object> syncData = new HashMap<>();
+                syncData.put("devices", deviceCache.values());
+                syncData.put("rooms", roomCache);
+                syncData.put("timestamp", System.currentTimeMillis());
+                syncData.put("source", "android_homie");
+                syncData.put("network_bound", true);
+
+                String message = gson.toJson(syncData);
+
+                if (esp32MqttClient != null && esp32MqttClient.isConnected()) {
+                    esp32MqttClient.publish(TOPIC_SYNC, message.getBytes(), 1, false);
+                    Log.d(TAG, "Sent MQTT sync data");
+                }
+
+            } catch (Exception e) {
+                Log.e(TAG, "Error syncing data: " + e.getMessage(), e);
+                mainHandler.post(() -> syncInProgress.setValue(false));
+            }
+        });
+    }
+
+    public void syncSettingsWithESP32(Map<String, Object> settings) {
+        if (!networkBound) {
+            Log.w(TAG, "Cannot sync settings - network not bound");
+            return;
+        }
+
+        executorService.execute(() -> {
+            try {
+                settings.put("timestamp", System.currentTimeMillis());
+                settings.put("source", "android_homie");
+                settings.put("network_bound", true);
+
+                String message = gson.toJson(settings);
+
+                if (esp32MqttClient != null && esp32MqttClient.isConnected()) {
+                    esp32MqttClient.publish(TOPIC_SETTINGS_SYNC, message.getBytes(), 1, false);
+                    Log.d(TAG, "Sent MQTT settings sync");
+                }
+
+            } catch (Exception e) {
+                Log.e(TAG, "Error syncing settings with ESP32: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    private void setupRetryMechanism() {
+        retryRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (!Boolean.TRUE.equals(esp32Connected.getValue()) && !networkBound) {
+                    int attempts = connectionAttempts.getAndIncrement();
+                    if (attempts >= 50) {
+                        Log.w(TAG, "Max retry attempts reached: " + attempts);
+                        stopRetryMechanism();
+                        return;
+                    }
+                    Log.d(TAG, "Retry attempt #" + (attempts + 1) + " to bind to ESP32 network");
+                    requestNetworkBinding();
+                    long delay = Math.min(5000 * (long) Math.pow(2, attempts), 60000);
+                    retryHandler.postDelayed(this, delay);
+                }
+            }
+        };
+    }
+
+    private void setupHealthCheck() {
+        healthCheckRunnable = new Runnable() {
+            @Override
+            public void run() {
+                checkConnectionHealth();
+                healthCheckHandler.postDelayed(this, 15000);
+            }
+        };
+        healthCheckHandler.postDelayed(healthCheckRunnable, 15000);
+    }
+
+    private void checkConnectionHealth() {
+        executorService.execute(() -> {
+            boolean wifiOk = networkBound && isConnectedToESP32();
+            boolean mqttOk = esp32MqttClient != null && esp32MqttClient.isConnected();
+            long timeSinceHeartbeat = System.currentTimeMillis() - lastHeartbeat.get();
+
+            Log.d(TAG, "Health check: wifiOk=" + wifiOk + ", mqttOk=" + mqttOk + ", timeSinceHeartbeat="
+                    + timeSinceHeartbeat);
+
+            mainHandler.post(() -> {
+                wifiConnected.setValue(wifiOk);
+                mqttConnected.setValue(mqttOk);
+            });
+
+            boolean overallConnected = wifiOk && mqttOk;
+
+            if (Boolean.TRUE.equals(esp32Connected.getValue()) && !overallConnected) {
+                Log.w(TAG, "Connection health check failed");
+                mainHandler.post(() -> {
+                    esp32Connected.setValue(false);
+                    connectionStatus.setValue(0);
+                });
+                startRetryMechanism();
+            } else if (!Boolean.TRUE.equals(esp32Connected.getValue()) && overallConnected) {
+                Log.i(TAG, "Connection restored");
+                mainHandler.post(() -> {
+                    esp32Connected.setValue(true);
+                    connectionStatus.setValue(2);
+                });
+                stopRetryMechanism();
+                lastSuccessfulConnection.set(System.currentTimeMillis());
+                connectionAttempts.set(0);
+            }
+        });
+    }
+
+    private void startRetryMechanism() {
+        stopRetryMechanism();
+        retryHandler.post(retryRunnable);
+    }
+
+    private void stopRetryMechanism() {
+        retryHandler.removeCallbacks(retryRunnable);
+    }
+
+    private void sendHeartbeat() {
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (Boolean.TRUE.equals(esp32Connected.getValue()) && networkBound) {
+                    try {
+                        Map<String, Object> heartbeat = new HashMap<>();
+                        heartbeat.put("timestamp", System.currentTimeMillis());
+                        heartbeat.put("source", "android_homie");
+                        heartbeat.put("uptime", System.currentTimeMillis() - lastSuccessfulConnection.get());
+                        heartbeat.put("network_bound", networkBound);
+
+                        String message = gson.toJson(heartbeat);
+
+                        if (esp32MqttClient != null && esp32MqttClient.isConnected()) {
+                            esp32MqttClient.publish("homie/system/heartbeat/android", message.getBytes(), 0, false);
+                        }
+
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error sending heartbeat: " + e.getMessage(), e);
+                    }
+
+                    mainHandler.postDelayed(this, 30000);
+                }
+            }
+        }, 30000);
+    }
+
+    private void startPeriodicSync() {
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (esp32Connected.getValue() == Boolean.TRUE && networkBound) {
+                    syncDataWithESP32();
+                }
+                mainHandler.postDelayed(this, 60000);
+            }
+        }, 60000);
+    }
+
+    private void saveDeviceToPreferences(Device device) {
+        SharedPreferences.Editor editor = preferences.edit();
+        editor.putString("device_" + device.getId(), gson.toJson(device));
+        editor.apply();
+    }
+
+    private void saveTemperatureData(Map<String, Float> temperatures) {
+        SharedPreferences.Editor editor = preferences.edit();
+        editor.putString("temperatures", gson.toJson(temperatures));
+        editor.putLong("temp_timestamp", System.currentTimeMillis());
+        editor.apply();
+    }
+
+    private void loadCachedData() {
+        Map<String, ?> allPrefs = preferences.getAll();
+        for (Map.Entry<String, ?> entry : allPrefs.entrySet()) {
+            if (entry.getKey().startsWith("device_")) {
+                try {
+                    Device device = gson.fromJson((String) entry.getValue(), Device.class);
+                    deviceCache.put(device.getId(), device);
+                } catch (Exception e) {
+                    Log.e(TAG, "Error loading cached device: " + e.getMessage(), e);
+                }
+            }
+        }
+
+        if (!deviceCache.isEmpty()) {
+            mainHandler.post(() -> deviceUpdates.setValue(new ArrayList<>(deviceCache.values())));
+        }
+    }
+
+    public MutableLiveData<Boolean> getEsp32Connected() {
+        return esp32Connected;
+    }
+
+    public MutableLiveData<Boolean> getWifiConnected() {
+        return wifiConnected;
+    }
+
+    public MutableLiveData<Boolean> getMqttConnected() {
+        return mqttConnected;
+    }
+
+    public MutableLiveData<Integer> getConnectionStatus() {
+        return connectionStatus;
+    }
+
+    public MutableLiveData<List<Device>> getDeviceUpdates() {
+        return deviceUpdates;
+    }
+
+    public MutableLiveData<Map<String, Float>> getTemperatureData() {
+        return temperatureData;
+    }
+
+    public MutableLiveData<Boolean> getSyncInProgress() {
+        return syncInProgress;
+    }
+
+    public boolean isESP32ServiceConnected() {
+        Boolean connected = esp32Connected.getValue();
+        return connected != null && connected;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return binder;
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        return START_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        stopRetryMechanism();
+        healthCheckHandler.removeCallbacks(healthCheckRunnable);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && networkBound) {
+            connectivityManager.bindProcessToNetwork(null);
+        }
+
+        try {
+            if (esp32MqttClient != null && esp32MqttClient.isConnected()) {
+                esp32MqttClient.disconnect();
+                esp32MqttClient.close();
+            }
+            if (executorService != null) {
+                executorService.shutdown();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Cleanup error", e);
+        }
+    }
+}
